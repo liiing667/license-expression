@@ -85,6 +85,13 @@ PARSE_INVALID_SYMBOL = 103
 if PARSE_INVALID_SYMBOL not in PARSE_ERRORS:
     PARSE_ERRORS[PARSE_INVALID_SYMBOL] = "A proper license symbol is needed."
 
+PARSE_INVALID_LICENSE_REF = 104
+if PARSE_INVALID_LICENSE_REF not in PARSE_ERRORS:
+    PARSE_ERRORS[PARSE_INVALID_LICENSE_REF] = (
+        "Invalid LicenseRef or DocumentRef: only letters, numbers, "
+        "underscore, dot, hyphen and spaces are allowed."
+    )
+
 
 class ExpressionError(Exception):
     pass
@@ -309,7 +316,13 @@ class Licensing(boolean.BooleanAlgebra):
         """
         ex1 = self._parse_and_simplify(expression1, **kwargs)
         ex2 = self._parse_and_simplify(expression2, **kwargs)
-        return ex1 == ex2
+        if ex1 == ex2:
+            return True
+
+        if ex1 is None or ex2 is None:
+            return False
+
+        return expressions_are_equivalent(ex1, ex2)
 
     def contains(self, expression1, expression2, **kwargs):
         """
@@ -470,7 +483,7 @@ class Licensing(boolean.BooleanAlgebra):
     def validate_license_keys(self, expression):
         unknown_keys = self.unknown_license_keys(expression, unique=True)
         if unknown_keys:
-            msg = "Unknown license key(s): {}".format(", ".join(unknown_keys))
+            msg = build_unknown_license_keys_message(unknown_keys)
             raise ExpressionError(msg)
 
     def parse(self, expression, validate=False, strict=False, simple=False, **kwargs):
@@ -604,6 +617,7 @@ class Licensing(boolean.BooleanAlgebra):
             token_value = token.value
 
             if isinstance(token_value, BaseSymbol):
+                validate_license_ref_symbol(token_value, token_string, pos)
                 token_obj = token_value
             elif isinstance(token_value, Keyword):
                 token_obj = token_value.type
@@ -701,6 +715,15 @@ class Licensing(boolean.BooleanAlgebra):
                 else:
                     sym = symbols.get(sym_or_op_lower)
                     if not sym:
+                        if is_license_ref_like_key(sym_or_op) and not is_valid_license_ref(
+                            sym_or_op
+                        ):
+                            raise ParseError(
+                                token_type=TOKEN_SYMBOL,
+                                token_string=sym_or_op,
+                                position=start,
+                                error_code=PARSE_INVALID_LICENSE_REF,
+                            )
                         sym = LicenseSymbol(key=sym_or_op)
                     yield Token(start, end, sym_or_op, sym)
 
@@ -782,6 +805,32 @@ class Licensing(boolean.BooleanAlgebra):
         else:
             raise ExpressionError(f"Unknown expression type: {expression!r}")
         return deduped
+
+    def normalize(self, expression, **kwargs):
+        """
+        Return a canonical LicenseExpression for a license ``expression``
+        (string or LicenseExpression object).
+
+        The canonical form applies:
+
+        - associativity: nested same-operator AND/OR sub-expressions are
+          flattened (e.g. "(MIT AND Apache-2.0) AND BSD" becomes
+          "Apache-2.0 AND BSD AND MIT");
+
+        - deduplication: repeated operands of the same sub-expression are
+          removed (e.g. "MIT AND MIT" becomes "MIT");
+
+        - sorting: the operands of each sub-expression are sorted for a stable
+          canonical ordering.
+
+        The returned expression string (through ``str()``) can be parsed back
+        to an equal expression and normalization is idempotent: normalizing
+        twice yields the same result as normalizing once.
+        """
+        parsed = self.parse(expression, **kwargs)
+        if parsed is None:
+            return
+        return normalize_expression(parsed, licensing=self)
 
     def validate(self, expression, strict=True, **kwargs):
         """
@@ -932,6 +981,13 @@ def build_symbols_from_unknown_tokens(tokens):
             string = " ".join(t.string for t in unmatched if t.string.strip())
             start = unmatched[0].start
             end = unmatched[-1].end
+            if is_license_ref_like_key(string) and not is_valid_license_ref(string):
+                raise ParseError(
+                    token_type=TOKEN_SYMBOL,
+                    token_string=string,
+                    position=start,
+                    error_code=PARSE_INVALID_LICENSE_REF,
+                )
             toksym = LicenseSymbol(string)
             unmatched.clear()
             yield Token(start, end, string, toksym)
@@ -1202,6 +1258,197 @@ class BaseSymbol(Renderable, boolean.Symbol):
 
 # validate license keys
 is_valid_license_key = re.compile(r"^[-:\w\s\.\+]+$", re.UNICODE).match
+
+# A LicenseRef or DocumentRef-prefixed LicenseRef as used in SPDX expressions
+# such as "LicenseRef-Acme-1.0" or "DocumentRef-doc:LicenseRef-Acme-1.0".
+# Letters, numbers, underscore, dot, hyphen and spaces are allowed; any other
+# symbol character is a syntax error.
+is_valid_license_ref = re.compile(
+    r"^(?:DocumentRef-[\w\s\.\-]+:)?LicenseRef-[\w\s\.\-]+$",
+    re.UNICODE,
+).match
+
+
+def is_license_ref_key(key):
+    """
+    Return True if ``key`` is a plain LicenseRef key such as
+    "LicenseRef-Acme-1.0" (a reference local to the current document).
+    """
+    return isinstance(key, str) and key.startswith("LicenseRef-")
+
+
+def is_document_ref_key(key):
+    """
+    Return True if ``key`` is a document-scoped LicenseRef key such as
+    "DocumentRef-doc:LicenseRef-Acme-1.0".
+    """
+    return isinstance(key, str) and key.startswith("DocumentRef-") and ":LicenseRef-" in key
+
+
+def document_ref_document(key):
+    """
+    Return the document identifier of a document-scoped LicenseRef ``key``
+    such as "doc" for "DocumentRef-doc:LicenseRef-Acme-1.0".
+    Return None for a plain LicenseRef key.
+    """
+    if is_document_ref_key(key):
+        document_ref = key.split(":", 1)[0]
+        return document_ref[len("DocumentRef-"):]
+
+
+def is_license_ref_like_key(key):
+    """
+    Return True if ``key`` looks like a LicenseRef or DocumentRef construct
+    and should therefore be checked for valid characters.
+    """
+    return isinstance(key, str) and (
+        key.startswith("LicenseRef-") or key.startswith("DocumentRef-")
+    )
+
+
+def validate_license_ref_symbol(symbol, token_string, position):
+    """
+    Raise a ParseError if a ``symbol`` BaseSymbol contains a LicenseRef or
+    DocumentRef key with invalid characters. ``token_string`` and
+    ``position`` describe the offending token in the parsed expression.
+    """
+    for sym in symbol.decompose():
+        key = sym.key
+        if is_license_ref_like_key(key) and not is_valid_license_ref(key):
+            raise ParseError(
+                token_type=TOKEN_SYMBOL,
+                token_string=token_string,
+                position=position,
+                error_code=PARSE_INVALID_LICENSE_REF,
+            )
+
+
+def build_unknown_license_keys_message(unknown_keys):
+    """
+    Return an error message string for an ``unknown_keys`` sequence of license
+    keys, telling apart plain license keys, plain LicenseRef references (in
+    the current document) and document-scoped LicenseRef references (with
+    their owning document).
+    """
+    plain_keys = []
+    plain_refs = []
+    document_refs = []
+
+    for key in unknown_keys:
+        if is_document_ref_key(key):
+            document_refs.append(key)
+        elif is_license_ref_key(key):
+            plain_refs.append(key)
+        else:
+            plain_keys.append(key)
+
+    messages = []
+    if plain_keys:
+        messages.append("Unknown license key(s): {}".format(", ".join(plain_keys)))
+
+    if plain_refs:
+        messages.append(
+            "Unknown license reference(s) in the current document: "
+            "{}".format(", ".join(plain_refs))
+        )
+
+    if document_refs:
+        refs = ", ".join(
+            f"{ref} (in document: {document_ref_document(ref)})" for ref in document_refs
+        )
+        messages.append(f"Unknown document license reference(s): {refs}")
+
+    return "; ".join(messages)
+
+
+def normalize_expression(expression, licensing=None):
+    """
+    Return a canonical LicenseExpression for an ``expression`` object by
+    flattening nested same-operator AND/OR sub-expressions (associativity),
+    deduplicating and sorting operands. ``licensing`` is the Licensing object
+    used to build new AND/OR expressions and defaults to a shared instance.
+    """
+    if licensing is None:
+        licensing = Licensing()
+
+    if isinstance(expression, boolean.AND):
+        relation = licensing.AND
+    elif isinstance(expression, boolean.OR):
+        relation = licensing.OR
+    else:
+        # a literal symbol or TRUE/FALSE constant
+        return expression
+
+    normalized_args = []
+    for arg in expression.args:
+        normalized = normalize_expression(arg, licensing=licensing)
+        if isinstance(normalized, relation):
+            # associativity: flatten nested same-relation sub-expressions
+            normalized_args.extend(normalized.args)
+        else:
+            normalized_args.append(normalized)
+
+    unique_args = []
+    for arg in normalized_args:
+        if arg not in unique_args:
+            unique_args.append(arg)
+
+    unique_args.sort(key=str)
+
+    if len(unique_args) == 1:
+        return unique_args[0]
+
+    return relation(*unique_args)
+
+
+# maximum number of distinct symbols in two expressions for an exhaustive
+# truth-table equivalence check to be practical
+MAX_SYMBOLS_FOR_EQUIVALENCE_CHECK = 16
+
+
+def expressions_are_equivalent(expression1, expression2):
+    """
+    Return True if two LicenseExpression objects are logically equivalent by
+    evaluating both expressions over every truth assignment of their symbols.
+    Return False when the expressions differ or when they use too many
+    distinct symbols for an exhaustive check.
+    """
+    symbols = ordered_unique(
+        list(expression1.get_symbols()) + list(expression2.get_symbols())
+    )
+
+    if len(symbols) > MAX_SYMBOLS_FOR_EQUIVALENCE_CHECK:
+        return False
+
+    for values in itertools.product((False, True), repeat=len(symbols)):
+        assignment = dict(zip(symbols, values))
+        if evaluate_expression(expression1, assignment) != evaluate_expression(
+            expression2, assignment
+        ):
+            return False
+
+    return True
+
+
+def evaluate_expression(expression, assignment):
+    """
+    Return the boolean value of an ``expression`` given an ``assignment``
+    mapping of Symbol to boolean values.
+    """
+    if isinstance(expression, boolean.Symbol):
+        return assignment[expression]
+
+    if isinstance(expression, boolean.AND):
+        return all(evaluate_expression(arg, assignment) for arg in expression.args)
+
+    if isinstance(expression, boolean.OR):
+        return any(evaluate_expression(arg, assignment) for arg in expression.args)
+
+    if isinstance(expression, boolean.NOT):
+        return not evaluate_expression(expression.args[0], assignment)
+
+    # TRUE or FALSE constants
+    return bool(expression)
 
 
 # TODO: we need to implement comparison by hand instead

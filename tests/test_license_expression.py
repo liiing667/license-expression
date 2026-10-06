@@ -2640,3 +2640,206 @@ class CombineExpressionTest(TestCase):
 
     def test_combine_expressions_with_or_relationship(self):
         assert str(combine_expressions(["mit", "apache-2.0"], "OR")) == "mit OR apache-2.0"
+
+
+class DocumentRefScopingTest(TestCase):
+    def test_same_licenseref_under_different_documentrefs_are_distinct_symbols(self):
+        licensing = Licensing()
+        expression = "DocumentRef-a:LicenseRef-x AND DocumentRef-b:LicenseRef-x"
+        parsed = licensing.parse(expression)
+        symbols = licensing.license_symbols(parsed)
+        assert symbols == [
+            LicenseSymbol("DocumentRef-a:LicenseRef-x"),
+            LicenseSymbol("DocumentRef-b:LicenseRef-x"),
+        ]
+        assert symbols[0] != symbols[1]
+
+    def test_documentref_symbol_is_distinct_from_plain_licenseref_symbol(self):
+        licensing = Licensing()
+        parsed = licensing.parse("LicenseRef-x AND DocumentRef-a:LicenseRef-x")
+        symbols = licensing.license_symbols(parsed)
+        assert symbols == [
+            LicenseSymbol("LicenseRef-x"),
+            LicenseSymbol("DocumentRef-a:LicenseRef-x"),
+        ]
+
+    def test_known_plain_licenseref_does_not_make_documentref_known(self):
+        licensing = Licensing([LicenseSymbol("MIT"), LicenseSymbol("LicenseRef-x")])
+        parsed = licensing.parse("MIT AND DocumentRef-a:LicenseRef-x")
+        assert licensing.unknown_license_keys(parsed) == ["DocumentRef-a:LicenseRef-x"]
+
+    def test_known_documentref_does_not_make_plain_licenseref_known(self):
+        licensing = Licensing([LicenseSymbol("MIT"), LicenseSymbol("DocumentRef-a:LicenseRef-x")])
+        parsed = licensing.parse("MIT AND LicenseRef-x")
+        assert licensing.unknown_license_keys(parsed) == ["LicenseRef-x"]
+
+    def test_documentrefs_are_not_deduplicated_against_each_other(self):
+        licensing = Licensing()
+        parsed = licensing.parse(
+            "DocumentRef-a:LicenseRef-x AND DocumentRef-b:LicenseRef-x "
+            "AND DocumentRef-a:LicenseRef-x"
+        )
+        normalized = licensing.normalize(parsed)
+        assert str(normalized) == "DocumentRef-a:LicenseRef-x AND DocumentRef-b:LicenseRef-x"
+
+
+class LicenseRefValidationTest(TestCase):
+    def get_licensing(self):
+        return Licensing([LicenseSymbol("MIT"), LicenseSymbol("Apache-2.0")])
+
+    def test_validate_unknown_plain_licenseref_reports_plain_reference(self):
+        licensing = self.get_licensing()
+        try:
+            licensing.parse("MIT AND LicenseRef-Acme-1.0", validate=True)
+            self.fail("ExpressionError not raised")
+        except ExpressionError as ee:
+            message = str(ee)
+            assert "LicenseRef-Acme-1.0" in message
+            assert "current document" in message
+            assert "document license reference" not in message
+
+    def test_validate_unknown_documentref_reports_document_reference_and_document(self):
+        licensing = self.get_licensing()
+        try:
+            licensing.parse("MIT AND DocumentRef-doc:LicenseRef-x", validate=True)
+            self.fail("ExpressionError not raised")
+        except ExpressionError as ee:
+            message = str(ee)
+            assert "DocumentRef-doc:LicenseRef-x" in message
+            assert "document license reference" in message
+            assert "doc" in message
+
+    def test_validate_mixed_unknown_keys_and_refs(self):
+        licensing = self.get_licensing()
+        try:
+            licensing.parse(
+                "gpl AND LicenseRef-mine AND DocumentRef-doc:LicenseRef-x", validate=True
+            )
+            self.fail("ExpressionError not raised")
+        except ExpressionError as ee:
+            message = str(ee)
+            assert "Unknown license key(s): gpl" in message
+            assert "LicenseRef-mine" in message
+            assert "DocumentRef-doc:LicenseRef-x" in message
+
+    def test_validate_expression_info_reports_documentref_errors(self):
+        licensing = self.get_licensing()
+        result = licensing.validate("MIT AND DocumentRef-doc:LicenseRef-x")
+        assert result.errors == [
+            "Unknown document license reference(s): "
+            "DocumentRef-doc:LicenseRef-x (in document: doc)"
+        ]
+        assert result.invalid_symbols == ["DocumentRef-doc:LicenseRef-x"]
+
+    def test_licenseref_with_invalid_characters_is_a_syntax_error(self):
+        licensing = self.get_licensing()
+        for expression in [
+            "LicenseRef-bad+ref",
+            "LicenseRef-bad/ref",
+            "DocumentRef-doc:LicenseRef-x:y",
+            "MIT AND LicenseRef-bad+ref",
+        ]:
+            try:
+                licensing.parse(expression)
+                self.fail(f"ParseError not raised for: {expression!r}")
+            except ParseError:
+                pass
+
+    def test_licenseref_with_invalid_characters_is_a_syntax_error_simple_tokenizer(self):
+        licensing = self.get_licensing()
+        try:
+            licensing.parse("LicenseRef-bad+ref", simple=True)
+            self.fail("ParseError not raised")
+        except ParseError:
+            pass
+
+    def test_licenseref_with_underscore_and_space_is_accepted(self):
+        licensing = self.get_licensing()
+        parsed = licensing.parse("LicenseRef-my_ref AND MIT")
+        assert licensing.license_keys(parsed) == ["LicenseRef-my_ref", "MIT"]
+
+    def test_valid_documentref_still_parses(self):
+        licensing = self.get_licensing()
+        parsed = licensing.parse("DocumentRef-doc:LicenseRef-x AND MIT")
+        assert licensing.license_keys(parsed) == ["DocumentRef-doc:LicenseRef-x", "MIT"]
+
+
+class NormalizeExpressionTest(TestCase):
+    def test_normalize_deduplicates(self):
+        licensing = Licensing()
+        assert str(licensing.normalize("MIT AND MIT")) == "MIT"
+        assert str(licensing.normalize("MIT OR MIT OR BSD")) == "BSD OR MIT"
+
+    def test_normalize_sorts(self):
+        licensing = Licensing()
+        assert str(licensing.normalize("MIT AND Apache-2.0 AND BSD")) == (
+            "Apache-2.0 AND BSD AND MIT"
+        )
+
+    def test_normalize_flattens_nested_same_operators(self):
+        licensing = Licensing()
+        assert str(licensing.normalize("(MIT AND Apache-2.0) AND BSD")) == (
+            "Apache-2.0 AND BSD AND MIT"
+        )
+        assert str(licensing.normalize("MIT OR (Apache-2.0 OR BSD)")) == (
+            "Apache-2.0 OR BSD OR MIT"
+        )
+
+    def test_normalize_keeps_mixed_operators_nested(self):
+        licensing = Licensing()
+        assert str(licensing.normalize("MIT OR (BSD AND Apache-2.0)")) == (
+            "(Apache-2.0 AND BSD) OR MIT"
+        )
+
+    def test_normalize_round_trips_through_parse(self):
+        licensing = Licensing()
+        expression = "(MIT OR Apache-2.0) AND (BSD OR MIT) AND Apache-2.0"
+        normalized = licensing.normalize(expression)
+        reparsed = licensing.parse(str(normalized))
+        assert reparsed == normalized
+
+    def test_normalize_is_idempotent(self):
+        licensing = Licensing()
+        expression = "(MIT OR Apache-2.0) AND (BSD OR MIT) AND Apache-2.0"
+        once = licensing.normalize(expression)
+        twice = licensing.normalize(once)
+        assert once == twice
+        assert str(once) == str(twice)
+
+    def test_normalize_accepts_expression_objects(self):
+        licensing = Licensing()
+        parsed = licensing.parse("MIT AND MIT")
+        assert str(licensing.normalize(parsed)) == "MIT"
+
+    def test_normalize_returns_none_for_empty_expression(self):
+        licensing = Licensing()
+        assert licensing.normalize("") is None
+        assert licensing.normalize(None) is None
+
+
+class IsEquivalentTest(TestCase):
+    def test_is_equivalent_with_duplicates(self):
+        licensing = Licensing()
+        assert licensing.is_equivalent("MIT AND MIT", "MIT")
+
+    def test_is_equivalent_with_distributivity(self):
+        licensing = Licensing()
+        assert licensing.is_equivalent("(A OR B) AND C", "(A AND C) OR (B AND C)")
+
+    def test_is_equivalent_with_absorption(self):
+        licensing = Licensing()
+        assert licensing.is_equivalent("A AND (A OR B)", "A")
+
+    def test_is_not_equivalent_with_only_and_or_later(self):
+        licensing = Licensing()
+        assert not licensing.is_equivalent("GPL-2.0-only", "GPL-2.0-or-later")
+
+    def test_is_not_equivalent_with_and_versus_or(self):
+        licensing = Licensing()
+        assert not licensing.is_equivalent("MIT AND Apache-2.0", "MIT OR Apache-2.0")
+
+    def test_is_equivalent_with_none(self):
+        licensing = Licensing()
+        assert licensing.is_equivalent(None, None)
+        assert not licensing.is_equivalent(None, "MIT")
+        assert not licensing.is_equivalent("MIT", None)
